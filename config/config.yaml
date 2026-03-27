@@ -1,0 +1,83 @@
+camera:
+  kind: webcam
+  source: 0
+  width: 1280
+  height: 720
+  fps: 30
+  reconnect_interval_seconds: 2.0
+  open_timeout_seconds: 5.0
+  simulate_on_failure: true
+pipeline:
+  capture_queue_size: 4
+  processing_poll_timeout_seconds: 0.25
+  drop_policy: drop_oldest
+  max_processing_fps: 30
+inspection:
+  roi:
+    enabled: false
+    x: 100
+    y: 100
+    width: 400
+    height: 300
+  save_fail_images: true
+  save_pass_images: false
+  annotation_enabled: true
+  strategies:
+  - type: presence
+    enabled: true
+    params:
+      min_non_zero_ratio: 0.005
+      min_mean_intensity: 20.0
+  - type: contour_count
+    enabled: true
+    params:
+      threshold_value: 100
+      min_contours: 1
+      min_contour_area: 250.0
+  - type: defect_threshold
+    enabled: true
+    params:
+      threshold_value: 80
+      object_threshold_value: 100
+      mode: dark
+      max_defect_ratio: 0.08
+  - type: area_range
+    enabled: true
+    params:
+      threshold_value: 100
+      min_area: 5000.0
+      max_area: 150000.0
+  - type: alignment
+    enabled: true
+    params:
+      threshold_value: 100
+      expected_x_pct: 0.5
+      expected_y_pct: 0.5
+      tolerance_px: 80.0
+storage:
+  base_dir: data
+  failed_dir_name: failed
+  passed_dir_name: passed
+  snapshots_dir_name: snapshots
+  exports_dir_name: exports
+  raw_dir_name: images
+  daily_rotation: true
+database:
+  url: sqlite:///data/inspection.db
+  echo: false
+logging:
+  level: INFO
+  log_dir: data/logs
+  max_bytes: 5000000
+  backup_count: 5
+  format: '%(asctime)s | %(levelname)s | %(threadName)s | %(name)s | %(message)s'
+ui:
+  window_title: Machine Vision Inspection System
+  preview_width: 960
+  preview_height: 540
+  max_recent_failed: 8
+  ui_refresh_ms: 100
+api:
+  enabled: false
+  host: 127.0.0.1
+  port: 8000
