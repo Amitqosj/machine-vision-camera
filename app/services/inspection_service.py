@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from threading import RLock
@@ -45,6 +46,7 @@ class InspectionService:
         self._camera: BaseCamera = create_camera(config.camera, logger=self._camera_logger)
         self._pipeline: RealTimePipeline | None = None
         self._latest_frame: np.ndarray | None = None
+        self._manual_frame_id = 0
         self._lock = RLock()
 
         self._on_frame_callback: Callable[[FramePacket], None] | None = None
@@ -166,6 +168,48 @@ class InspectionService:
         path = self._image_storage.save_snapshot(frame)
         self._logger.info("Snapshot saved to %s", path)
         return path
+
+    def process_uploaded_frame(self, frame: np.ndarray) -> InspectionResult:
+        """
+        Run one inspection cycle for a frame uploaded from browser camera.
+
+        This path allows cloud deployments to process client-side camera frames
+        without requiring direct access to physical webcam devices.
+        """
+        if frame is None or frame.size == 0:
+            raise ValueError("Uploaded frame is empty.")
+
+        with self._lock:
+            frame_id = self._manual_frame_id
+            self._manual_frame_id += 1
+
+        packet = FramePacket(
+            frame_id=frame_id,
+            timestamp=time.time(),
+            frame=frame.copy(),
+        )
+        result = self._engine.inspect(packet)
+
+        with self._lock:
+            self._latest_frame = (
+                result.annotated_frame.copy()
+                if result.annotated_frame is not None
+                else frame.copy()
+            )
+
+        self._runtime_state.set_running(True)
+        self._runtime_state.set_camera_connected(True)
+        self._handle_result(result)
+        return result
+
+    def stop_browser_camera_mode(self) -> None:
+        """Reset runtime flags when browser camera mode stops."""
+        with self._lock:
+            if self._pipeline is not None and self._pipeline.is_running():
+                return
+        self._runtime_state.set_running(False)
+        self._runtime_state.set_camera_connected(False)
+        self._publish_status()
 
     def update_roi(self, x: int, y: int, width: int, height: int, enabled: bool = True) -> None:
         """Update ROI in both runtime engine and in-memory config."""

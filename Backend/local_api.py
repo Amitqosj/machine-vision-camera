@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import time
@@ -24,6 +26,7 @@ from app.db.repository import InspectionRepository
 from app.services.image_storage_service import ImageStorageService
 from app.services.inspection_service import InspectionService
 from app.services.report_service import ReportService
+from app.chamber.store import CAM_MACHINE, CAM_USB1, CAM_USB2, ChamberStore
 
 MAX_QUERY_LIMIT = 250
 
@@ -36,6 +39,50 @@ class RoiUpdateRequest(BaseModel):
     y: int = Field(ge=0)
     width: int = Field(gt=0)
     height: int = Field(gt=0)
+
+
+class BrowserFrameRequest(BaseModel):
+    """Payload for browser-captured frame uploads."""
+
+    image_base64: str
+
+
+class ChamberPreviewBody(BaseModel):
+    """Enable or disable preview for a chamber camera slot."""
+
+    enabled: bool
+
+
+class ChamberRecordingBody(BaseModel):
+    """Start or stop recording flag for a camera slot."""
+
+    recording: bool
+
+
+class ChamberSessionSaveBody(BaseModel):
+    """Persist session manifest (simulated until storage is wired)."""
+
+    save_path: str = "D:\\ChamberRecordings"
+    session_name: str | None = None
+    batch_id: str | None = None
+
+
+class ArduinoLightBody(BaseModel):
+    on: bool
+
+
+class ArduinoAutoLightBody(BaseModel):
+    enabled: bool
+
+
+class ArduinoRelayBody(BaseModel):
+    channel: int = Field(ge=1, le=8)
+    on: bool
+
+
+class ArduinoSerialBody(BaseModel):
+    com_port: str | None = None
+    baud_rate: int | None = None
 
 
 def _resolve_database_url(database_url: str, project_root: Path) -> str:
@@ -99,8 +146,64 @@ def _placeholder_frame(width: int, height: int) -> np.ndarray:
     return frame
 
 
+def _decode_image_bytes(image_bytes: bytes) -> np.ndarray:
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Unable to decode uploaded image.")
+    return frame
+
+
+def _decode_base64_image(image_base64: str) -> np.ndarray:
+    payload = image_base64.strip()
+    if not payload:
+        raise ValueError("Uploaded frame is empty.")
+    if payload.startswith("data:"):
+        _, _, payload = payload.partition(",")
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Uploaded frame is not valid base64 image data.") from exc
+    return _decode_image_bytes(raw)
+
+
 def _coerce_limit(limit: int) -> int:
     return max(1, min(limit, MAX_QUERY_LIMIT))
+
+
+CHAMBER_CAMERA_SLUGS = {
+    "machine-vision": CAM_MACHINE,
+    "usb-1": CAM_USB1,
+    "usb-2": CAM_USB2,
+}
+
+
+def _usb_sim_mjpeg_frame(label: str, width: int = 640, height: int = 480) -> bytes:
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(
+        frame,
+        label,
+        (24, height // 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (200, 220, 240),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        "Simulated USB feed (OpenCV)",
+        (24, height // 2 + 36),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (140, 160, 200),
+        1,
+        cv2.LINE_AA,
+    )
+    success, encoded = cv2.imencode(".jpg", frame)
+    if not success:
+        raise ValueError("USB placeholder encode failed")
+    return encoded.tobytes()
 
 
 def create_backend_app(config_path: Path, project_root: Path) -> FastAPI:
@@ -130,6 +233,7 @@ def create_backend_app(config_path: Path, project_root: Path) -> FastAPI:
         runtime_state=runtime_state,
         logger=logger,
     )
+    chamber_store = ChamberStore()
 
     app = FastAPI(title="Machine Vision Inspection API", version="1.0.0")
     app.add_middleware(
@@ -198,6 +302,11 @@ def create_backend_app(config_path: Path, project_root: Path) -> FastAPI:
         inspection_service.stop()
         return {"message": "Inspection stopped."}
 
+    @app.post("/api/browser/stop")
+    def stop_browser_camera_mode() -> dict[str, str]:
+        inspection_service.stop_browser_camera_mode()
+        return {"message": "Browser camera mode stopped."}
+
     @app.post("/api/control/reset-counters")
     def reset_counters() -> dict[str, str]:
         inspection_service.reset_counters()
@@ -233,6 +342,24 @@ def create_backend_app(config_path: Path, project_root: Path) -> FastAPI:
             enabled=payload.enabled,
         )
         return {"message": "ROI updated."}
+
+    @app.post("/api/browser/process-frame")
+    def process_browser_frame(payload: BrowserFrameRequest) -> dict[str, Any]:
+        try:
+            decoded = _decode_base64_image(payload.image_base64)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            result = inspection_service.process_uploaded_frame(decoded)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Failed to process browser frame: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to process uploaded frame: {exc}",
+            ) from exc
+
+        return {"message": "Frame processed.", "result": result.as_dict()}
 
     @app.get("/api/frame.jpg")
     def get_frame() -> Response:
@@ -270,6 +397,186 @@ def create_backend_app(config_path: Path, project_root: Path) -> FastAPI:
             frame_generator(),
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
+
+    def _chamber_public() -> dict[str, Any]:
+        snap = runtime_state.snapshot()
+        return chamber_store.to_public_dict(
+            config,
+            snap["running"],
+            snap["camera_connected"],
+        )
+
+    @app.get("/api/chamber/status")
+    def chamber_status() -> dict[str, Any]:
+        return _chamber_public()
+
+    def _usb_stream_response(cam_id: str, title_live: str, title_idle: str) -> StreamingResponse:
+        delay = 1.0 / 15.0
+
+        def frame_generator():
+            while True:
+                live = chamber_store.usb_preview_active(cam_id)
+                label = title_live if live else title_idle
+                try:
+                    encoded = _usb_sim_mjpeg_frame(label)
+                except ValueError:
+                    time.sleep(delay)
+                    continue
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-cache\r\n\r\n" + encoded + b"\r\n"
+                )
+                time.sleep(delay)
+
+        return StreamingResponse(
+            frame_generator(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
+
+    @app.get("/api/chamber/stream/usb1")
+    def chamber_stream_usb1() -> StreamingResponse:
+        return _usb_stream_response(
+            CAM_USB1,
+            "USB Camera 1 — LIVE (simulated)",
+            "USB1 — connect & start preview",
+        )
+
+    @app.get("/api/chamber/stream/usb2")
+    def chamber_stream_usb2() -> StreamingResponse:
+        return _usb_stream_response(
+            CAM_USB2,
+            "USB Camera 2 — LIVE (simulated)",
+            "USB2 — connect & start preview",
+        )
+
+    @app.post("/api/chamber/cameras/{slug}/connect")
+    def chamber_camera_connect(slug: str) -> dict[str, Any]:
+        cam = CHAMBER_CAMERA_SLUGS.get(slug)
+        if cam is None:
+            raise HTTPException(status_code=404, detail="Unknown camera.")
+        try:
+            if cam == CAM_MACHINE:
+                chamber_store.connect_machine_vision(config, logger)
+            else:
+                chamber_store.connect_usb(cam, logger)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Chamber connect failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"message": "Camera connected.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/cameras/{slug}/disconnect")
+    def chamber_camera_disconnect(slug: str) -> dict[str, Any]:
+        cam = CHAMBER_CAMERA_SLUGS.get(slug)
+        if cam is None:
+            raise HTTPException(status_code=404, detail="Unknown camera.")
+        try:
+            if cam == CAM_MACHINE:
+                chamber_store.disconnect_machine_vision(inspection_service, logger)
+            else:
+                chamber_store.disconnect_usb(cam, logger)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Chamber disconnect failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"message": "Camera disconnected.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/cameras/{slug}/preview")
+    def chamber_camera_preview(slug: str, body: ChamberPreviewBody) -> dict[str, Any]:
+        cam = CHAMBER_CAMERA_SLUGS.get(slug)
+        if cam is None:
+            raise HTTPException(status_code=404, detail="Unknown camera.")
+        try:
+            if cam == CAM_MACHINE:
+                chamber_store.set_preview_machine_vision(body.enabled, inspection_service, logger)
+            else:
+                chamber_store.set_preview_usb(cam, body.enabled, logger)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Chamber preview failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"message": "Preview updated.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/cameras/{slug}/capture")
+    def chamber_camera_capture(slug: str) -> dict[str, Any]:
+        cam = CHAMBER_CAMERA_SLUGS.get(slug)
+        if cam is None:
+            raise HTTPException(status_code=404, detail="Unknown camera.")
+        try:
+            if cam == CAM_MACHINE:
+                snap_path = chamber_store.capture_machine_vision(inspection_service, logger)
+                return {"message": "Snapshot captured.", "path": snap_path, "chamber": _chamber_public()}
+            capture_id = chamber_store.capture_usb(cam, logger)
+            return {"message": "Capture recorded (simulated).", "captureId": capture_id, "chamber": _chamber_public()}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Chamber capture failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/chamber/cameras/{slug}/recording")
+    def chamber_camera_recording(slug: str, body: ChamberRecordingBody) -> dict[str, Any]:
+        cam = CHAMBER_CAMERA_SLUGS.get(slug)
+        if cam is None:
+            raise HTTPException(status_code=404, detail="Unknown camera.")
+        try:
+            if cam == CAM_MACHINE:
+                chamber_store.set_recording_machine_vision(body.recording, inspection_service, logger)
+            else:
+                chamber_store.set_recording_usb(cam, body.recording, logger)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Chamber recording failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"message": "Recording updated.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/session/save")
+    def chamber_session_save(body: ChamberSessionSaveBody) -> dict[str, Any]:
+        chamber_store.save_session(
+            save_path=body.save_path,
+            session_name=body.session_name,
+            batch_id=body.batch_id,
+        )
+        return {"message": "Session saved.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/arduino/connect")
+    def chamber_arduino_connect() -> dict[str, Any]:
+        chamber_store.arduino_connect()
+        return {"message": "Arduino connected.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/arduino/disconnect")
+    def chamber_arduino_disconnect() -> dict[str, Any]:
+        chamber_store.arduino_disconnect()
+        return {"message": "Arduino disconnected.", "chamber": _chamber_public()}
+
+    @app.patch("/api/chamber/arduino/serial")
+    def chamber_arduino_serial(body: ArduinoSerialBody) -> dict[str, Any]:
+        chamber_store.arduino_set_serial(body.com_port, body.baud_rate)
+        return {"message": "Serial settings updated.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/arduino/light")
+    def chamber_arduino_light(body: ArduinoLightBody) -> dict[str, Any]:
+        try:
+            chamber_store.arduino_light(body.on)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"message": "Light updated.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/arduino/auto-light")
+    def chamber_arduino_auto_light(body: ArduinoAutoLightBody) -> dict[str, Any]:
+        chamber_store.set_auto_light_enabled(body.enabled)
+        return {"message": "Auto light updated.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/arduino/trigger")
+    def chamber_arduino_trigger() -> dict[str, Any]:
+        chamber_store.arduino_trigger()
+        return {"message": "Trigger sent.", "chamber": _chamber_public()}
+
+    @app.post("/api/chamber/arduino/relay")
+    def chamber_arduino_relay(body: ArduinoRelayBody) -> dict[str, Any]:
+        chamber_store.arduino_relay(body.channel, body.on)
+        return {"message": "Relay command logged.", "chamber": _chamber_public()}
 
     @app.get("/api/images/{inspection_id}")
     def get_image(inspection_id: str) -> FileResponse:
